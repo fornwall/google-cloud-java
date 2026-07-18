@@ -112,29 +112,28 @@ public class GapicSpannerRpcConnectionTest {
 
       // Poll active loopback connections for up to 1000ms with an aggressive 1ms wait
       Stopwatch watch = Stopwatch.createStarted();
-      while (activeNetworkConnections.get() < 48 && watch.elapsed(TimeUnit.MILLISECONDS) < 1000L) {
+      while (activeNetworkConnections.get() < 16 && watch.elapsed(TimeUnit.MILLISECONDS) < 1000L) {
         try {
           Thread.sleep(1L);
         } catch (InterruptedException ignored) {
         }
       }
 
-      // Sleep for an extra 5ms after seeing 48 connections (or hitting timeout) to
+      // Sleep for an extra 5ms after seeing 16 connections (or hitting timeout) to
       // ensure we catch any additional connections that are created.
       try {
         Thread.sleep(5L);
       } catch (InterruptedException ignored) {
       }
 
-      // Assert that the Spanner client stubs eagerly construct exactly 3 fallback channels:
-      // 1. Shared pool for the Data client and PartitionedDML client stubs
-      // 2. Dedicated pool for the InstanceAdmin client stub
-      // 3. Dedicated pool for the DatabaseAdmin client stub
-      // Each fallback channel contains a primary and fallback pool (totaling 6
-      // GcpManagedChannel pools).
-      // Since the default pool size is 8 channels when gRPC-GCP is enabled, they eagerly
-      // establish exactly 48 physical Loopback TCP connection sockets (6 pools of size 8).
-      assertEquals(48, activeNetworkConnections.get());
+      // Only the Data client (and the PartitionedDML client, which shares its channel pool) builds
+      // its fallback channel eagerly. The InstanceAdmin and DatabaseAdmin stubs are now created
+      // lazily on first use, so they no longer establish sockets at construction time.
+      // The single eager fallback channel contains a primary and fallback pool (2 GcpManagedChannel
+      // pools). Since the default pool size is 8 channels when gRPC-GCP is enabled, this eagerly
+      // establishes exactly 16 physical Loopback TCP connection sockets (2 pools of size 8).
+      // Previously all three stubs were built eagerly (6 pools = 48 sockets).
+      assertEquals(16, activeNetworkConnections.get());
     } finally {
       if (rpc != null) {
         rpc.shutdown();

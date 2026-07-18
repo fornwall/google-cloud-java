@@ -1470,8 +1470,12 @@ public class GapicSpannerRpcTest {
       GrpcGcpObjectCounts before = countGrpcGcpObjectsFromChannelz();
       rpc = new GapicSpannerRpc(options);
       GrpcGcpObjectCounts counts = countGrpcGcpObjectsFromChannelz().minus(before);
-      assertEquals(counts.debugString(), 6, counts.gcpManagedChannels);
-      assertEquals(counts.debugString(), 48, counts.channelRefs);
+      // Only the data stub builds its grpc-gcp channels at construction (one grpc-gcp layer per
+      // path: directpath + cloudpath). The instance-admin and database-admin stubs are created
+      // lazily on first use, so they no longer contribute channels here (previously 6/48 with all
+      // three stubs built eagerly).
+      assertEquals(counts.debugString(), 2, counts.gcpManagedChannels);
+      assertEquals(counts.debugString(), 16, counts.channelRefs);
     } finally {
       if (rpc != null) {
         rpc.shutdown();
