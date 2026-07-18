@@ -17,28 +17,38 @@
 package com.google.cloud.spanner;
 
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyMap;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.cloud.spanner.TransactionRunnerImpl.TransactionContextImpl;
 import com.google.cloud.spanner.XGoogSpannerRequestId.NoopRequestIdCreator;
 import com.google.cloud.spanner.spi.v1.SpannerRpc;
 import com.google.cloud.spanner.v1.stub.SpannerStubSettings;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
 import com.google.protobuf.Timestamp;
 import com.google.rpc.Code;
 import com.google.rpc.Status;
 import com.google.spanner.v1.CommitRequest;
 import com.google.spanner.v1.ExecuteBatchDmlRequest;
 import com.google.spanner.v1.ExecuteBatchDmlResponse;
+import com.google.spanner.v1.RollbackRequest;
+import com.google.spanner.v1.TransactionOptions;
+import com.google.spanner.v1.TransactionSelector;
 import io.opentelemetry.api.common.Attributes;
 import java.util.Collections;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -210,6 +220,53 @@ public class TransactionContextImplTest {
               .setTransactionId(transactionId)
               .build();
       verify(rpc).commitAsync(eq(request), anyMap());
+    }
+  }
+
+  /**
+   * Reproduces the scenario where the begin-carrying first statement of an inline-begin read-write
+   * transaction fails to even start its RPC (for example because the client was closed, the
+   * executor rejected the task, or an interceptor threw). In that case {@code
+   * AbstractReadContext#startStream} calls {@code onStartFailed(withBeginTransaction, t)} rather
+   * than {@code onError}/{@code onDone}. If {@code onStartFailed} does not complete the {@code
+   * transactionIdFuture} that {@code getTransactionSelector} created for the inline begin, a
+   * subsequent {@code rollback()} would block forever on its unbounded {@code get()} of that
+   * future.
+   */
+  @Test
+  public void testRollbackDoesNotHangWhenInlineBeginStatementFailsToStart()
+      throws InterruptedException, ExecutionException, TimeoutException {
+    when(session.defaultTransactionOptions()).thenReturn(TransactionOptions.getDefaultInstance());
+    // Build an inline-begin context, i.e. one without a pre-existing transaction id.
+    try (TransactionContextImpl context =
+        TransactionContextImpl.newBuilder()
+            .setSession(session)
+            .setRpc(rpc)
+            .setSpan(span)
+            .setTracer(tracer)
+            .setOptions(Options.fromTransactionOptions())
+            .build()) {
+      // Mirror what startStream() does for the first statement: request the transaction selector
+      // (which lazily creates the transactionIdFuture and returns a BeginTransaction selector), ...
+      TransactionSelector selector = context.getTransactionSelector();
+      assertTrue(selector.hasBegin());
+
+      // ... and then report that starting the RPC for that statement failed synchronously.
+      RuntimeException startFailure = new RuntimeException("channel closed");
+      context.onStartFailed(/* withBeginTransaction= */ true, startFailure);
+
+      // The future must now be completed exceptionally so that no waiter (including rollback)
+      // hangs.
+      assertTrue(context.transactionIdFuture.isDone());
+      ExecutionException futureException =
+          assertThrows(ExecutionException.class, () -> context.transactionIdFuture.get());
+      assertTrue(futureException.getCause() == startFailure);
+
+      // rollback() must return promptly. As no transaction was ever begun on the backend, no
+      // Rollback RPC should be sent.
+      ApiFuture<Empty> rollback = context.rollbackAsync();
+      assertTrue(rollback.get(60L, TimeUnit.SECONDS).equals(Empty.getDefaultInstance()));
+      verify(rpc, never()).rollbackAsync(any(RollbackRequest.class), anyMap());
     }
   }
 
