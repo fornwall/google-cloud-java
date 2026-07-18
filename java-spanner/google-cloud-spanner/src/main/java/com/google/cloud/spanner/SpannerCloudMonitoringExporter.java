@@ -56,6 +56,7 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 /**
  * Spanner Cloud Monitoring OpenTelemetry Exporter.
@@ -72,7 +73,27 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
   // https://cloud.google.com/monitoring/quotas#custom_metrics_quotas.
   private static final int EXPORT_BATCH_SIZE_LIMIT = 200;
   private final Set<String> spannerExportFailureLoggedProjects = ConcurrentHashMap.newKeySet();
-  private final MetricServiceClient client;
+
+  /**
+   * Creates the underlying {@link MetricServiceClient}. Invoked lazily so that the (relatively
+   * expensive) Cloud Monitoring client — with its own channel, executor and watchdog — is only
+   * built the first time metrics are actually exported, rather than eagerly while the Spanner
+   * client is still being constructed.
+   */
+  @FunctionalInterface
+  interface MetricServiceClientFactory {
+    MetricServiceClient create() throws IOException;
+  }
+
+  private final MetricServiceClientFactory clientFactory;
+  private final Object clientLock = new Object();
+
+  @GuardedBy("clientLock")
+  private MetricServiceClient client;
+
+  @GuardedBy("clientLock")
+  private boolean shutdown;
+
   private final Supplier<String> fallbackProjectIdSupplier;
 
   static SpannerCloudMonitoringExporter create(
@@ -114,8 +135,12 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
     // it as not retried for now.
     settingsBuilder.createServiceTimeSeriesSettings().setSimpleTimeoutNoRetriesDuration(timeout);
 
+    // Building the settings is cheap, but creating the MetricServiceClient allocates a channel,
+    // executor and watchdog. Defer that to the first export() so it does not slow down Spanner
+    // client construction (the first metric export only happens after the first reader interval).
+    MetricServiceSettings settings = settingsBuilder.build();
     return new SpannerCloudMonitoringExporter(
-        fallbackProjectIdSupplier, MetricServiceClient.create(settingsBuilder.build()));
+        fallbackProjectIdSupplier, () -> MetricServiceClient.create(settings));
   }
 
   @VisibleForTesting
@@ -126,32 +151,64 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
   @VisibleForTesting
   SpannerCloudMonitoringExporter(
       Supplier<String> fallbackProjectIdSupplier, MetricServiceClient client) {
-    this.client = client;
+    this(fallbackProjectIdSupplier, () -> client);
+  }
+
+  @VisibleForTesting
+  SpannerCloudMonitoringExporter(
+      Supplier<String> fallbackProjectIdSupplier, MetricServiceClientFactory clientFactory) {
+    this.clientFactory = clientFactory;
     this.fallbackProjectIdSupplier = fallbackProjectIdSupplier;
+  }
+
+  /**
+   * Returns the lazily-created {@link MetricServiceClient}, or {@code null} if the exporter has
+   * already been shut down.
+   */
+  @Nullable
+  private MetricServiceClient getOrCreateClient() throws IOException {
+    synchronized (clientLock) {
+      if (shutdown) {
+        return null;
+      }
+      if (client == null) {
+        client = clientFactory.create();
+      }
+      return client;
+    }
   }
 
   @Override
   public CompletableResultCode export(@Nonnull Collection<MetricData> collection) {
-    if (client.isShutdown()) {
-      logger.log(Level.WARNING, "Exporter is shut down");
-      return CompletableResultCode.ofFailure();
-    }
-
-    return exportSpannerClientMetrics(collection);
-  }
-
-  @VisibleForTesting
-  MetricServiceClient getMetricServiceClient() {
-    return client;
-  }
-
-  /** Export client built in metrics */
-  private CompletableResultCode exportSpannerClientMetrics(Collection<MetricData> collection) {
-    // Skips exporting if there's none
+    // Skip exporting (and avoid creating the Cloud Monitoring client) when there's nothing to send.
     if (collection.isEmpty()) {
       return CompletableResultCode.ofSuccess();
     }
 
+    MetricServiceClient client;
+    try {
+      client = getOrCreateClient();
+    } catch (Throwable e) {
+      logger.log(
+          Level.WARNING, "Failed to create the Cloud Monitoring client for exporting metrics", e);
+      return CompletableResultCode.ofFailure();
+    }
+    if (client == null || client.isShutdown()) {
+      logger.log(Level.WARNING, "Exporter is shut down");
+      return CompletableResultCode.ofFailure();
+    }
+
+    return exportSpannerClientMetrics(collection, client);
+  }
+
+  @VisibleForTesting
+  MetricServiceClient getMetricServiceClient() throws IOException {
+    return getOrCreateClient();
+  }
+
+  /** Export client built in metrics */
+  private CompletableResultCode exportSpannerClientMetrics(
+      Collection<MetricData> collection, MetricServiceClient client) {
     List<TimeSeries> spannerTimeSeries;
     try {
       spannerTimeSeries =
@@ -182,7 +239,8 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
     List<ApiFuture<List<Empty>>> futures = new ArrayList<>();
     for (Map.Entry<String, List<TimeSeries>> entry : timeSeriesByProject.entrySet()) {
       ProjectName projectName = ProjectName.of(entry.getKey());
-      ApiFuture<List<Empty>> future = exportTimeSeriesInBatch(projectName, entry.getValue());
+      ApiFuture<List<Empty>> future =
+          exportTimeSeriesInBatch(projectName, entry.getValue(), client);
       ApiFutures.addCallback(
           future,
           new ApiFutureCallback<List<Empty>>() {
@@ -246,7 +304,7 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
   }
 
   private ApiFuture<List<Empty>> exportTimeSeriesInBatch(
-      ProjectName projectName, List<TimeSeries> timeSeries) {
+      ProjectName projectName, List<TimeSeries> timeSeries, MetricServiceClient client) {
     List<ApiFuture<Empty>> batchResults = new ArrayList<>();
 
     for (List<TimeSeries> batch : Iterables.partition(timeSeries, EXPORT_BATCH_SIZE_LIMIT)) {
@@ -255,7 +313,7 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
               .setName(projectName.toString())
               .addAllTimeSeries(batch)
               .build();
-      batchResults.add(this.client.createServiceTimeSeriesCallable().futureCall(req));
+      batchResults.add(client.createServiceTimeSeriesCallable().futureCall(req));
     }
 
     return ApiFutures.allAsList(batchResults);
@@ -268,13 +326,22 @@ class SpannerCloudMonitoringExporter implements MetricExporter {
 
   @Override
   public CompletableResultCode shutdown() {
-    if (client.isShutdown()) {
-      logger.log(Level.WARNING, "shutdown is called multiple times");
+    MetricServiceClient clientToShutdown;
+    synchronized (clientLock) {
+      if (shutdown) {
+        logger.log(Level.WARNING, "shutdown is called multiple times");
+        return CompletableResultCode.ofSuccess();
+      }
+      shutdown = true;
+      clientToShutdown = client;
+    }
+    // The client is created lazily on the first export, so it may never have been created.
+    if (clientToShutdown == null) {
       return CompletableResultCode.ofSuccess();
     }
     CompletableResultCode shutdownResult = new CompletableResultCode();
     try {
-      client.shutdown();
+      clientToShutdown.shutdown();
       shutdownResult.succeed();
     } catch (Throwable e) {
       logger.log(Level.WARNING, "failed to shutdown the monitoring client", e);
