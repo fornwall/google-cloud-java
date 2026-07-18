@@ -365,8 +365,8 @@ class TransactionRunnerImpl implements SessionTransaction, TransactionRunner {
                     rpc.getCommitRetrySettings().getTotalTimeout().getSeconds() + 5,
                     TimeUnit.SECONDS);
       } catch (InterruptedException | TimeoutException e) {
-        if (commitFuture != null) {
-          commitFuture.cancel(true);
+        if (inFlightCommitFuture != null) {
+          inFlightCommitFuture.cancel(true);
         }
         if (e instanceof InterruptedException) {
           throw SpannerExceptionFactory.propagateInterrupt((InterruptedException) e);
@@ -378,7 +378,7 @@ class TransactionRunnerImpl implements SessionTransaction, TransactionRunner {
       }
     }
 
-    volatile ApiFuture<CommitResponse> commitFuture;
+    volatile ApiFuture<com.google.spanner.v1.CommitResponse> inFlightCommitFuture;
 
     ApiFuture<CommitResponse> commitAsync() {
       close();
@@ -491,6 +491,7 @@ class TransactionRunnerImpl implements SessionTransaction, TransactionRunner {
           try (IScope ignore = tracer.withSpan(opSpan)) {
             commitFuture = rpc.commitAsync(commitRequest, getTransactionChannelHint());
           }
+          inFlightCommitFuture = commitFuture;
           session.markUsed(clock.instant());
           commitFuture.addListener(
               () -> {
