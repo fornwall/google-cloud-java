@@ -54,6 +54,7 @@ import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.TraceFlags;
 import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.common.InstrumentationScopeInfo;
 import io.opentelemetry.sdk.metrics.InstrumentType;
 import io.opentelemetry.sdk.metrics.data.AggregationTemporality;
@@ -70,6 +71,7 @@ import io.opentelemetry.sdk.metrics.internal.data.ImmutableSumData;
 import io.opentelemetry.sdk.resources.Resource;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.junit.After;
 import org.junit.Before;
@@ -680,6 +682,76 @@ public class SpannerCloudMonitoringExporterTest {
 
     assertEquals("abc.goog", metricServiceSettings.getUniverseDomain());
     assertEquals("monitoringa.abc.goog:443", metricServiceSettings.getEndpoint());
+  }
+
+  @Test
+  public void testClientCreatedLazilyOnFirstNonEmptyExport() {
+    AtomicInteger creationCount = new AtomicInteger();
+    SpannerCloudMonitoringExporter lazyExporter =
+        new SpannerCloudMonitoringExporter(
+            () -> null,
+            () -> {
+              creationCount.incrementAndGet();
+              return fakeMetricServiceClient;
+            });
+
+    // The client must not be created at construction time.
+    assertThat(creationCount.get()).isEqualTo(0);
+
+    // An empty export must not trigger client creation either.
+    assertThat(lazyExporter.export(Collections.emptyList()).isSuccess()).isTrue();
+    assertThat(creationCount.get()).isEqualTo(0);
+
+    UnaryCallable<CreateTimeSeriesRequest, Empty> mockCallable =
+        mock(UnaryCallable.class, withSettings().withoutAnnotations());
+    when(mockMetricServiceStub.createServiceTimeSeriesCallable()).thenReturn(mockCallable);
+    when(mockCallable.futureCall(Mockito.any()))
+        .thenReturn(ApiFutures.immediateFuture(Empty.getDefaultInstance()));
+
+    // The first non-empty export creates the client exactly once...
+    lazyExporter.export(Collections.singletonList(buildLongData()));
+    assertThat(creationCount.get()).isEqualTo(1);
+
+    // ...and subsequent exports reuse it.
+    lazyExporter.export(Collections.singletonList(buildLongData()));
+    assertThat(creationCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void testShutdownBeforeExportDoesNotCreateClient() {
+    AtomicInteger creationCount = new AtomicInteger();
+    SpannerCloudMonitoringExporter lazyExporter =
+        new SpannerCloudMonitoringExporter(
+            () -> null,
+            () -> {
+              creationCount.incrementAndGet();
+              return fakeMetricServiceClient;
+            });
+
+    // Shutting down before any export succeeds without ever creating the client.
+    assertThat(lazyExporter.shutdown().isSuccess()).isTrue();
+    assertThat(creationCount.get()).isEqualTo(0);
+
+    // A second shutdown is a no-op.
+    assertThat(lazyExporter.shutdown().isSuccess()).isTrue();
+
+    // Exporting after shutdown fails and still never creates a client.
+    CompletableResultCode exportResult =
+        lazyExporter.export(Collections.singletonList(buildLongData()));
+    assertThat(exportResult.isSuccess()).isFalse();
+    assertThat(creationCount.get()).isEqualTo(0);
+  }
+
+  private MetricData buildLongData() {
+    LongPointData longPointData = ImmutableLongPointData.create(10, 15, attributes, 11L);
+    return ImmutableMetricData.createLongSum(
+        resource,
+        InstrumentationScopeInfo.create(GRPC_METER_NAME),
+        "spanner.googleapis.com/internal/client/" + OPERATION_COUNT_NAME,
+        "description",
+        "1",
+        ImmutableSumData.create(
+            true, AggregationTemporality.CUMULATIVE, ImmutableList.of(longPointData)));
   }
 
   private static class FakeMetricServiceClient extends MetricServiceClient {
