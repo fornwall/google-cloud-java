@@ -894,6 +894,22 @@ class TransactionRunnerImpl implements SessionTransaction, TransactionRunner {
     }
 
     @Override
+    void onStartFailed(boolean withBeginTransaction, Throwable t) {
+      // The statement that included the BeginTransaction option failed to even start the RPC (for
+      // example because the client was closed, the executor rejected the task, or an interceptor
+      // threw). Unlike onError/onDone, this is not reached through the normal statement result
+      // handling, so the transactionIdFuture that getTransactionSelector() created for the inline
+      // begin would otherwise never complete. That would hang any other statement waiting on it,
+      // and critically hang rollback()/commit() forever on their unbounded get() of the future.
+      // Fail the future here so those waiters are released.
+      if (withBeginTransaction
+          && transactionIdFuture != null
+          && !this.transactionIdFuture.isDone()) {
+        this.transactionIdFuture.setException(t);
+      }
+    }
+
+    @Override
     public void buffer(Mutation mutation) {
       synchronized (committingLock) {
         if (committing) {
