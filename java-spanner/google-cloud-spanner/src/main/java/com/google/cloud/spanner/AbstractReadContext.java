@@ -433,38 +433,47 @@ abstract class AbstractReadContext
         return selector;
       }
 
-      ApiFuture<ByteString> futureToWaitFor = null;
-      txnLock.lock();
-      try {
-        if (transactionId != null) {
-          return TransactionSelector.newBuilder().setId(transactionId).build();
+      final long deadlineNanos =
+          System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WAIT_FOR_INLINE_BEGIN_TIMEOUT_MILLIS);
+      while (true) {
+        ApiFuture<ByteString> futureToWaitFor;
+        txnLock.lock();
+        try {
+          if (transactionId != null) {
+            return TransactionSelector.newBuilder().setId(transactionId).build();
+          }
+          if (transactionIdFuture == null) {
+            transactionIdFuture = SettableApiFuture.create();
+            return TransactionSelector.newBuilder()
+                .setBegin(createReadOnlyTransactionOptions())
+                .build();
+          }
+          futureToWaitFor = transactionIdFuture;
+        } finally {
+          txnLock.unlock();
         }
-        if (transactionIdFuture == null) {
-          transactionIdFuture = SettableApiFuture.create();
-          return TransactionSelector.newBuilder()
-              .setBegin(createReadOnlyTransactionOptions())
-              .build();
-        }
-        futureToWaitFor = transactionIdFuture;
-      } finally {
-        txnLock.unlock();
-      }
 
-      try {
-        return TransactionSelector.newBuilder()
-            .setId(futureToWaitFor.get(WAIT_FOR_INLINE_BEGIN_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS))
-            .build();
-      } catch (ExecutionException e) {
-        throw SpannerExceptionFactory.asSpannerException(e.getCause());
-      } catch (TimeoutException e) {
-        throw SpannerExceptionFactory.newSpannerException(
-            ErrorCode.DEADLINE_EXCEEDED,
-            "Timeout while waiting for an inlined read-only transaction to be returned by another"
-                + " statement.",
-            e);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw SpannerExceptionFactory.newSpannerExceptionForCancellation(null, e);
+        try {
+          return TransactionSelector.newBuilder()
+              .setId(futureToWaitFor.get(deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS))
+              .build();
+        } catch (ExecutionException e) {
+          // The statement that carried the inline BeginTransaction failed before a transaction was
+          // returned, and failTransactionIdFuture has reset transactionIdFuture. Retry the loop so
+          // this statement either takes over the BeginTransaction itself, or waits for another
+          // statement that already has. The error is propagated to the failed statement itself and
+          // should not fail unrelated statements. Read-only transactions take no locks, so unlike
+          // the read/write inline-begin path there is no need to abort the entire transaction.
+        } catch (TimeoutException e) {
+          throw SpannerExceptionFactory.newSpannerException(
+              ErrorCode.DEADLINE_EXCEEDED,
+              "Timeout while waiting for an inlined read-only transaction to be returned by another"
+                  + " statement.",
+              e);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw SpannerExceptionFactory.newSpannerExceptionForCancellation(null, e);
+        }
       }
     }
 
@@ -624,6 +633,10 @@ abstract class AbstractReadContext
       try {
         if (transactionIdFuture != null && !transactionIdFuture.isDone()) {
           transactionIdFuture.setException(t);
+          // Reset the future so the next statement attempts a new inline BeginTransaction instead
+          // of failing on the error of an earlier, unrelated statement. This mirrors the explicit
+          // BeginTransaction path, where a failed begin is retried by the next statement.
+          transactionIdFuture = null;
         }
       } finally {
         txnLock.unlock();

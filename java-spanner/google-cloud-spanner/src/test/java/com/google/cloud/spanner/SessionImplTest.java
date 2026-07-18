@@ -67,6 +67,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -725,18 +726,32 @@ public class SessionImplTest {
   }
 
   @Test
-  public void multiUseReadOnlyTransactionInlineBeginFirstQueryErrorPropagates() {
+  public void multiUseReadOnlyTransactionInlineBeginRetriesBeginAfterFailedFirstStatement()
+      throws ParseException {
     SpannerException error =
         SpannerExceptionFactory.newSpannerException(ErrorCode.INVALID_ARGUMENT, "bad query");
-    final ArgumentCaptor<SpannerRpc.ResultStreamConsumer> consumer =
+    final ArgumentCaptor<SpannerRpc.ResultStreamConsumer> queryConsumer =
         ArgumentCaptor.forClass(SpannerRpc.ResultStreamConsumer.class);
-    final ArgumentCaptor<ExecuteSqlRequest> request =
+    final ArgumentCaptor<ExecuteSqlRequest> queryRequest =
         ArgumentCaptor.forClass(ExecuteSqlRequest.class);
     Mockito.when(
-            rpc.executeQuery(request.capture(), consumer.capture(), anyMap(), any(), eq(false)))
+            rpc.executeQuery(
+                queryRequest.capture(), queryConsumer.capture(), anyMap(), any(), eq(false)))
         .then(
             invocation -> {
-              consumer.getValue().onError(error);
+              queryConsumer.getValue().onError(error);
+              return new NoOpStreamingCall();
+            });
+    PartialResultSet readResultSet = inlineBeginResultSet("recovered-tx");
+    final ArgumentCaptor<SpannerRpc.ResultStreamConsumer> readConsumer =
+        ArgumentCaptor.forClass(SpannerRpc.ResultStreamConsumer.class);
+    final ArgumentCaptor<ReadRequest> readRequest = ArgumentCaptor.forClass(ReadRequest.class);
+    Mockito.when(
+            rpc.read(readRequest.capture(), readConsumer.capture(), anyMap(), any(), eq(false)))
+        .then(
+            invocation -> {
+              readConsumer.getValue().onPartialResultSet(readResultSet);
+              readConsumer.getValue().onCompleted();
               return new NoOpStreamingCall();
             });
 
@@ -745,18 +760,119 @@ public class SessionImplTest {
         SpannerException e = assertThrows(SpannerException.class, () -> rs.next());
         assertEquals(ErrorCode.INVALID_ARGUMENT, e.getErrorCode());
       }
+      // The transaction should not be poisoned by the failed first statement: the next statement
+      // should attempt a new inline BeginTransaction.
+      txn.readRow("Dummy", Key.of(), Collections.singletonList("C"));
+      txn.readRow("Dummy", Key.of(), Collections.singletonList("C"));
+      assertEquals(
+          Timestamp.fromProto(Timestamps.parse("2015-10-01T10:54:20.021Z")),
+          txn.getReadTimestamp());
+    }
+
+    Mockito.verify(rpc, Mockito.never()).beginTransaction(Mockito.any(), anyMap(), eq(false));
+    assertEquals(1, queryRequest.getAllValues().size());
+    assertThat(queryRequest.getAllValues().get(0).getTransaction().hasBegin()).isTrue();
+    assertEquals(2, readRequest.getAllValues().size());
+    assertThat(readRequest.getAllValues().get(0).getTransaction().hasBegin()).isTrue();
+    assertEquals(
+        ByteString.copyFromUtf8("recovered-tx"),
+        readRequest.getAllValues().get(1).getTransaction().getId());
+  }
+
+  @Test
+  public void multiUseReadOnlyTransactionInlineBeginRecoversWhenNoTransactionIsReturned()
+      throws ParseException {
+    PartialResultSet resultSetWithoutTransaction = resultSetWithoutTransaction();
+    PartialResultSet resultSetWithTransaction = inlineBeginResultSet("second-attempt-tx");
+    final ArgumentCaptor<ReadRequest> request = ArgumentCaptor.forClass(ReadRequest.class);
+    final AtomicInteger callCount = new AtomicInteger();
+    Mockito.when(rpc.read(request.capture(), Mockito.any(), anyMap(), any(), eq(false)))
+        .then(
+            invocation -> {
+              SpannerRpc.ResultStreamConsumer consumer = invocation.getArgument(1);
+              consumer.onPartialResultSet(
+                  callCount.incrementAndGet() == 1
+                      ? resultSetWithoutTransaction
+                      : resultSetWithTransaction);
+              consumer.onCompleted();
+              return new NoOpStreamingCall();
+            });
+
+    try (ReadOnlyTransaction txn = inlineReadOnlyTransaction()) {
       SpannerException e =
           assertThrows(
               SpannerException.class,
               () -> txn.readRow("Dummy", Key.of(), Collections.singletonList("C")));
-      assertEquals(ErrorCode.INVALID_ARGUMENT, e.getErrorCode());
+      assertEquals(ErrorCode.FAILED_PRECONDITION, e.getErrorCode());
+      // The next statement should attempt a new inline BeginTransaction instead of failing on the
+      // error of the first statement.
+      txn.readRow("Dummy", Key.of(), Collections.singletonList("C"));
     }
 
     Mockito.verify(rpc, Mockito.never()).beginTransaction(Mockito.any(), anyMap(), eq(false));
-    assertEquals(1, request.getAllValues().size());
+    assertEquals(2, request.getAllValues().size());
     assertThat(request.getAllValues().get(0).getTransaction().hasBegin()).isTrue();
-    Mockito.verify(rpc, Mockito.never())
-        .read(Mockito.any(), Mockito.any(), anyMap(), any(), eq(false));
+    assertThat(request.getAllValues().get(1).getTransaction().hasBegin()).isTrue();
+  }
+
+  @Test
+  public void multiUseReadOnlyTransactionInlineBeginConcurrentStatementTakesOverFailedBegin()
+      throws Exception {
+    PartialResultSet takeOverResultSet = inlineBeginResultSet("take-over-tx");
+    SpannerException error =
+        SpannerExceptionFactory.newSpannerException(ErrorCode.INVALID_ARGUMENT, "bad read");
+    final List<ReadRequest> requests = Collections.synchronizedList(new ArrayList<>());
+    final List<SpannerRpc.ResultStreamConsumer> consumers =
+        Collections.synchronizedList(new ArrayList<>());
+    final AtomicInteger callCount = new AtomicInteger();
+    final CountDownLatch firstRpcStarted = new CountDownLatch(1);
+    Mockito.when(rpc.read(Mockito.any(), Mockito.any(), anyMap(), any(), eq(false)))
+        .then(
+            invocation -> {
+              int call = callCount.incrementAndGet();
+              ReadRequest readRequest = invocation.getArgument(0);
+              SpannerRpc.ResultStreamConsumer consumer = invocation.getArgument(1);
+              requests.add(readRequest);
+              consumers.add(consumer);
+              if (call == 1) {
+                firstRpcStarted.countDown();
+              } else {
+                consumer.onPartialResultSet(takeOverResultSet);
+                consumer.onCompleted();
+              }
+              return new NoOpStreamingCall();
+            });
+
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try (ReadOnlyTransaction txn = inlineReadOnlyTransaction()) {
+      Future<Struct> first =
+          executor.submit(() -> txn.readRow("Dummy", Key.of(), Collections.singletonList("C")));
+      assertThat(firstRpcStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+      Future<Struct> second =
+          executor.submit(() -> txn.readRow("Dummy", Key.of(), Collections.singletonList("C")));
+      Thread.sleep(100L);
+      assertThat(callCount.get()).isEqualTo(1);
+      assertThat(second.isDone()).isFalse();
+
+      // Fail the statement that carried the inline BeginTransaction. The concurrently waiting
+      // statement should take over the BeginTransaction instead of failing with the error of the
+      // first statement.
+      consumers.get(0).onError(error);
+
+      ExecutionException e =
+          assertThrows(ExecutionException.class, () -> first.get(5, TimeUnit.SECONDS));
+      assertThat(e.getCause()).isInstanceOf(SpannerException.class);
+      assertEquals(ErrorCode.INVALID_ARGUMENT, ((SpannerException) e.getCause()).getErrorCode());
+      assertThat(second.get(5, TimeUnit.SECONDS)).isNull();
+    } finally {
+      executor.shutdownNow();
+    }
+
+    Mockito.verify(rpc, Mockito.never()).beginTransaction(Mockito.any(), anyMap(), eq(false));
+    assertEquals(2, requests.size());
+    assertThat(requests.get(0).getTransaction().hasBegin()).isTrue();
+    assertThat(requests.get(1).getTransaction().hasBegin()).isTrue();
   }
 
   @Test
