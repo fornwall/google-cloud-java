@@ -941,6 +941,43 @@ public class GapicSpannerRpcTest {
   }
 
   @Test
+  public void testAdminCallAfterShutdownFailsInsteadOfCreatingStub() {
+    SpannerOptions options = createSpannerOptions();
+    GapicSpannerRpc rpc = new GapicSpannerRpc(options, true);
+    rpc.shutdown();
+
+    // The admin stubs are created lazily. An admin call after shutdown must fail instead of
+    // creating a new stub (with its own channels) that would never be closed.
+    SpannerException databaseException =
+        assertThrows(
+            SpannerException.class,
+            () -> rpc.getDatabase("projects/[PROJECT]/instances/[INSTANCE]/databases/[DATABASE]"));
+    assertEquals(ErrorCode.FAILED_PRECONDITION, databaseException.getErrorCode());
+    SpannerException instanceException =
+        assertThrows(
+            SpannerException.class,
+            () -> rpc.getInstance("projects/[PROJECT]/instances/[INSTANCE]"));
+    assertEquals(ErrorCode.FAILED_PRECONDITION, instanceException.getErrorCode());
+  }
+
+  @Test
+  public void testShutdownClosesLazilyCreatedAdminStub() {
+    SpannerOptions options = createSpannerOptions();
+    GapicSpannerRpc rpc = new GapicSpannerRpc(options, true);
+
+    // Trigger lazy creation of the database admin stub. The mock server does not implement the
+    // DatabaseAdmin service, so the call itself fails, but the stub and its channels are created.
+    SpannerException exception =
+        assertThrows(
+            SpannerException.class,
+            () -> rpc.getDatabase("projects/[PROJECT]/instances/[INSTANCE]/databases/[DATABASE]"));
+    assertEquals(ErrorCode.UNIMPLEMENTED, exception.getErrorCode());
+
+    // Shutdown must close the lazily created stub and terminate within the await timeout.
+    rpc.shutdown();
+  }
+
+  @Test
   public void testConcurrentClientCreationDoesNotRaceOnDirectPathFlag() throws Exception {
     // Concurrent creation of Spanner clients used to cause a data race on the static
     // DIRECTPATH_CHANNEL_CREATED field, which was written from the constructor without
@@ -1470,8 +1507,12 @@ public class GapicSpannerRpcTest {
       GrpcGcpObjectCounts before = countGrpcGcpObjectsFromChannelz();
       rpc = new GapicSpannerRpc(options);
       GrpcGcpObjectCounts counts = countGrpcGcpObjectsFromChannelz().minus(before);
-      assertEquals(counts.debugString(), 6, counts.gcpManagedChannels);
-      assertEquals(counts.debugString(), 48, counts.channelRefs);
+      // Only the data stub builds its grpc-gcp channels at construction (one grpc-gcp layer per
+      // path: directpath + cloudpath). The instance-admin and database-admin stubs are created
+      // lazily on first use, so they no longer contribute channels here (previously 6/48 with all
+      // three stubs built eagerly).
+      assertEquals(counts.debugString(), 2, counts.gcpManagedChannels);
+      assertEquals(counts.debugString(), 16, counts.channelRefs);
     } finally {
       if (rpc != null) {
         rpc.shutdown();
