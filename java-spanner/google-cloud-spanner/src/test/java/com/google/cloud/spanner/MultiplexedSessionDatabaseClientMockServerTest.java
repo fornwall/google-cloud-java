@@ -536,6 +536,126 @@ public class MultiplexedSessionDatabaseClientMockServerTest extends AbstractMock
   }
 
   @Test
+  public void testWriteAtLeastOnceReleasesSingleUseChannelHint() throws Exception {
+    // Channel hints are only used when the gRPC-GCP extension is disabled.
+    try (Spanner testSpanner = createSpannerWithoutGrpcGcp()) {
+      DatabaseClientImpl client =
+          (DatabaseClientImpl) testSpanner.getDatabaseClient(DatabaseId.of("p", "i", "d"));
+      int numChannels = testSpanner.getOptions().getNumChannels();
+
+      // Execute more mutation-only transactions than there are channels. Each transaction should
+      // release its channel hint when it is done, so the channel-spreading optimization keeps
+      // working for subsequent single-use transactions.
+      for (int i = 0; i < numChannels + 1; i++) {
+        assertNotNull(MockSpannerTestActions.writeAtLeastOnceInsertMutation(client));
+      }
+      assertEquals(0, getChannelUsage(client).cardinality());
+      assertEquals(0, getNumCurrentSingleUseTransactions(client).get());
+
+      // A subsequent single-use read-only transaction should still get a channel hint. The hint is
+      // held from the creation of the transaction until the result set has been consumed or closed.
+      try (ResultSet resultSet = client.singleUse().executeQuery(STATEMENT)) {
+        assertEquals(1, getChannelUsage(client).cardinality());
+        assertEquals(1, getNumCurrentSingleUseTransactions(client).get());
+        //noinspection StatementWithEmptyBody
+        while (resultSet.next()) {}
+      }
+      assertEquals(0, getChannelUsage(client).cardinality());
+      assertEquals(0, getNumCurrentSingleUseTransactions(client).get());
+    }
+  }
+
+  @Test
+  public void testFailedWriteAtLeastOnceReleasesSingleUseChannelHint() throws Exception {
+    try (Spanner testSpanner = createSpannerWithoutGrpcGcp()) {
+      DatabaseClientImpl client =
+          (DatabaseClientImpl) testSpanner.getDatabaseClient(DatabaseId.of("p", "i", "d"));
+      // Make sure that the multiplexed session has been created, so that the write transaction
+      // below does not use the delayed path (which never reserves a channel hint).
+      awaitMultiplexedSessionCreation(client);
+      mockSpanner.setCommitExecutionTime(
+          SimulatedExecutionTime.ofException(
+              Status.FAILED_PRECONDITION.withDescription("test").asRuntimeException()));
+
+      SpannerException exception =
+          assertThrows(
+              SpannerException.class,
+              () -> MockSpannerTestActions.writeAtLeastOnceInsertMutation(client));
+
+      assertEquals(ErrorCode.FAILED_PRECONDITION, exception.getErrorCode());
+      assertEquals(0, getChannelUsage(client).cardinality());
+      assertEquals(0, getNumCurrentSingleUseTransactions(client).get());
+    }
+  }
+
+  @Test
+  public void testBatchWriteAtLeastOnceReleasesSingleUseChannelHint() throws Exception {
+    try (Spanner testSpanner = createSpannerWithoutGrpcGcp()) {
+      DatabaseClientImpl client =
+          (DatabaseClientImpl) testSpanner.getDatabaseClient(DatabaseId.of("p", "i", "d"));
+      // Make sure that the multiplexed session has been created, so that the batch write below
+      // does not use the delayed path (which never reserves a channel hint).
+      awaitMultiplexedSessionCreation(client);
+
+      ServerStream<BatchWriteResponse> responseStream =
+          client.batchWriteAtLeastOnce(
+              ImmutableList.of(
+                  MutationGroup.of(
+                      Mutation.newInsertBuilder("FOO")
+                          .set("ID")
+                          .to(1L)
+                          .set("NAME")
+                          .to("Bar")
+                          .build())));
+      for (BatchWriteResponse response : responseStream) {
+        assertNotNull(response);
+      }
+
+      assertEquals(0, getChannelUsage(client).cardinality());
+      assertEquals(0, getNumCurrentSingleUseTransactions(client).get());
+    }
+  }
+
+  private void awaitMultiplexedSessionCreation(DatabaseClientImpl client) {
+    try (ResultSet resultSet = client.singleUse().executeQuery(STATEMENT)) {
+      //noinspection StatementWithEmptyBody
+      while (resultSet.next()) {}
+    }
+  }
+
+  private Spanner createSpannerWithoutGrpcGcp() {
+    return SpannerOptions.newBuilder()
+        .setProjectId("test-project")
+        .setChannelProvider(channelProvider)
+        .setCredentials(NoCredentials.getInstance())
+        .disableGrpcGcpExtension()
+        .setSessionPoolOption(
+            SessionPoolOptions.newBuilder()
+                .setUseMultiplexedSession(true)
+                .setUseMultiplexedSessionForRW(true)
+                .setUseMultiplexedSessionPartitionedOps(true)
+                .setFailOnSessionLeak()
+                .build())
+        .build()
+        .getService();
+  }
+
+  private static BitSet getChannelUsage(DatabaseClientImpl client) throws Exception {
+    java.lang.reflect.Field field =
+        MultiplexedSessionDatabaseClient.class.getDeclaredField("channelUsage");
+    field.setAccessible(true);
+    return (BitSet) field.get(client.multiplexedSessionDatabaseClient);
+  }
+
+  private static AtomicInteger getNumCurrentSingleUseTransactions(DatabaseClientImpl client)
+      throws Exception {
+    java.lang.reflect.Field field =
+        MultiplexedSessionDatabaseClient.class.getDeclaredField("numCurrentSingleUseTransactions");
+    field.setAccessible(true);
+    return (AtomicInteger) field.get(client.multiplexedSessionDatabaseClient);
+  }
+
+  @Test
   public void testWriteAtLeastOnceWithCommitStats() {
     DatabaseClientImpl client =
         (DatabaseClientImpl) spanner.getDatabaseClient(DatabaseId.of("p", "i", "d"));
