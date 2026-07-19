@@ -89,6 +89,8 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
 
     private boolean done;
 
+    private boolean channelHintReleased;
+
     MultiplexedSessionTransaction(
         MultiplexedSessionDatabaseClient client,
         ISpan span,
@@ -123,19 +125,18 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
       if (this.singleUse && getActiveTransaction() != null) {
         getActiveTransaction().close();
         setActive(null);
-        if (this.singleUseChannelHint != NO_CHANNEL_HINT) {
-          this.client.channelUsage.clear(this.singleUseChannelHint);
-        }
-        this.client.numCurrentSingleUseTransactions.decrementAndGet();
+        releaseSingleUseChannelHint();
       }
     }
 
     @Override
     public CommitResponse writeAtLeastOnceWithOptions(
         Iterable<Mutation> mutations, TransactionOption... options) throws SpannerException {
-      CommitResponse response = super.writeAtLeastOnceWithOptions(mutations, options);
-      onTransactionDone();
-      return response;
+      try {
+        return super.writeAtLeastOnceWithOptions(mutations, options);
+      } finally {
+        onTransactionDone();
+      }
     }
 
     @Override
@@ -149,6 +150,30 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
       }
       if (markedDone) {
         client.numSessionsReleased.incrementAndGet();
+      }
+      if (this.singleUse) {
+        // Mutation-only operations (writeAtLeastOnceWithOptions, batchWriteAtLeastOnce) never
+        // return a ResultSet and thus never call onReadDone(), so the channel hint must also be
+        // released here.
+        releaseSingleUseChannelHint();
+      }
+    }
+
+    /**
+     * Returns the channel hint that was reserved for this single-use transaction, so a subsequent
+     * single-use transaction can use the channel. This method is idempotent; the hint is released
+     * by whichever of {@link #onReadDone()} and {@link #onTransactionDone()} is called first.
+     */
+    private void releaseSingleUseChannelHint() {
+      boolean release = false;
+      synchronized (this) {
+        if (!this.channelHintReleased) {
+          this.channelHintReleased = true;
+          release = true;
+        }
+      }
+      if (release) {
+        this.client.releaseSingleUseChannelHint(this.singleUseChannelHint);
       }
     }
 
@@ -456,7 +481,11 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
   }
 
   private int getSingleUseChannelHint() {
+    // The counter tracks the number of single-use transactions that currently hold a channel hint,
+    // so it is only incremented when a hint is actually reserved, and any transient increment is
+    // rolled back before returning NO_CHANNEL_HINT.
     if (this.numCurrentSingleUseTransactions.incrementAndGet() > this.numChannels) {
+      this.numCurrentSingleUseTransactions.decrementAndGet();
       return NO_CHANNEL_HINT;
     }
     synchronized (this.channelUsage) {
@@ -466,11 +495,24 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
       // This then means that all channels have already been assigned to single-use transactions,
       // and that we should not use a specific channel, but rather pick a random one.
       if (channel == this.numChannels) {
+        this.numCurrentSingleUseTransactions.decrementAndGet();
         return NO_CHANNEL_HINT;
       }
       this.channelUsage.set(channel);
       return channel;
     }
+  }
+
+  private void releaseSingleUseChannelHint(int channelHint) {
+    if (channelHint == NO_CHANNEL_HINT) {
+      return;
+    }
+    // Take the same monitor as getSingleUseChannelHint(); the BitSet is not thread-safe and is
+    // shared by all clients of the same SpannerImpl.
+    synchronized (this.channelUsage) {
+      this.channelUsage.clear(channelHint);
+    }
+    this.numCurrentSingleUseTransactions.decrementAndGet();
   }
 
   private final AbstractLazyInitializer<Dialect> dialectSupplier =
