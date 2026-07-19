@@ -25,6 +25,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Ticker;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.RemovalNotification;
 import com.google.protobuf.ByteString;
 import com.google.spanner.v1.BeginTransactionRequest;
 import com.google.spanner.v1.CommitRequest;
@@ -46,12 +47,8 @@ import io.grpc.MethodDescriptor;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.trace.Span;
 import java.io.IOException;
-import java.lang.ref.ReferenceQueue;
-import java.lang.ref.SoftReference;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -72,7 +69,9 @@ final class KeyAwareChannel extends ManagedChannel {
 
   private static final long MAX_TRACKED_TRANSACTION_AFFINITIES = 100_000L;
   private static final long TRANSACTION_AFFINITY_TTL_MINUTES = 10L;
-  private static final int CHANNEL_FINDER_CLEANUP_INTERVAL = 1024;
+
+  @VisibleForTesting static final long MAX_CHANNEL_FINDERS = 100L;
+  @VisibleForTesting static final long CHANNEL_FINDER_TTL_MINUTES = 30L;
   private static final String STREAMING_READ_METHOD = "google.spanner.v1.Spanner/StreamingRead";
   private static final String STREAMING_SQL_METHOD =
       "google.spanner.v1.Spanner/ExecuteStreamingSql";
@@ -87,9 +86,10 @@ final class KeyAwareChannel extends ManagedChannel {
   @Nullable private final EndpointLifecycleManager lifecycleManager;
   private final String authority;
   private final String defaultEndpointAddress;
-  private final ReferenceQueue<ChannelFinder> channelFinderReferenceQueue = new ReferenceQueue<>();
-  private final Map<String, ChannelFinderReference> channelFinders = new ConcurrentHashMap<>();
-  private final AtomicInteger channelFinderCleanupCounter = new AtomicInteger();
+  // Per-database ChannelFinders, each owning bounded range and recipe caches. Bounded and aged out
+  // so that finders for databases that are no longer accessed do not accumulate for the lifetime
+  // of the channel; evicted finders are marked stale and unregistered from the lifecycle manager.
+  private final Cache<String, ChannelFinder> channelFinders;
   // Maps read-write transaction IDs to their last routed endpoint.
   // Bound and age out entries in case application code abandons a transaction
   // without sending Commit/Rollback or otherwise clearing affinity.
@@ -114,7 +114,7 @@ final class KeyAwareChannel extends ManagedChannel {
       @Nullable ChannelEndpointCacheFactory endpointCacheFactory,
       @Nullable GrpcGcpEndpointChannelConfigurator endpointChannelConfigurator,
       EndpointOverloadCooldownTracker endpointOverloadCooldowns,
-      Ticker transactionAffinityTicker)
+      Ticker cacheTicker)
       throws IOException {
     if (endpointCacheFactory == null) {
       this.endpointCache =
@@ -131,7 +131,8 @@ final class KeyAwareChannel extends ManagedChannel {
     this.lifecycleManager =
         (endpointCacheFactory == null) ? new EndpointLifecycleManager(endpointCache) : null;
     this.endpointOverloadCooldowns = endpointOverloadCooldowns;
-    this.transactionAffinities = newTransactionAffinities(transactionAffinityTicker);
+    this.transactionAffinities = newTransactionAffinities(cacheTicker);
+    this.channelFinders = newChannelFinders(cacheTicker);
   }
 
   static KeyAwareChannel create(
@@ -164,14 +165,10 @@ final class KeyAwareChannel extends ManagedChannel {
       InstantiatingGrpcChannelProvider channelProvider,
       @Nullable ChannelEndpointCacheFactory endpointCacheFactory,
       EndpointOverloadCooldownTracker endpointOverloadCooldowns,
-      Ticker transactionAffinityTicker)
+      Ticker cacheTicker)
       throws IOException {
     return new KeyAwareChannel(
-        channelProvider,
-        endpointCacheFactory,
-        null,
-        endpointOverloadCooldowns,
-        transactionAffinityTicker);
+        channelProvider, endpointCacheFactory, null, endpointOverloadCooldowns, cacheTicker);
   }
 
   private static Cache<ByteString, String> newTransactionAffinities(Ticker ticker) {
@@ -182,16 +179,22 @@ final class KeyAwareChannel extends ManagedChannel {
         .build();
   }
 
-  private static final class ChannelFinderReference extends SoftReference<ChannelFinder> {
-    final String databaseId;
-
-    ChannelFinderReference(
-        String databaseId,
-        ChannelFinder referent,
-        ReferenceQueue<? super ChannelFinder> referenceQueue) {
-      super(referent, referenceQueue);
-      this.databaseId = databaseId;
-    }
+  private Cache<String, ChannelFinder> newChannelFinders(Ticker ticker) {
+    return CacheBuilder.newBuilder()
+        .maximumSize(MAX_CHANNEL_FINDERS)
+        .expireAfterAccess(CHANNEL_FINDER_TTL_MINUTES, TimeUnit.MINUTES)
+        .ticker(ticker)
+        .removalListener(
+            (RemovalNotification<String, ChannelFinder> notification) -> {
+              ChannelFinder finder = notification.getValue();
+              if (finder != null) {
+                finder.markStale();
+              }
+              if (lifecycleManager != null) {
+                lifecycleManager.unregisterFinder(notification.getKey());
+              }
+            })
+        .build();
   }
 
   private String extractDatabaseIdFromSession(String session) {
@@ -205,48 +208,20 @@ final class KeyAwareChannel extends ManagedChannel {
     return session.substring(0, sessionsIndex);
   }
 
-  private void cleanupStaleChannelFinders() {
-    ChannelFinderReference reference;
-    while ((reference = (ChannelFinderReference) channelFinderReferenceQueue.poll()) != null) {
-      if (channelFinders.remove(reference.databaseId, reference) && lifecycleManager != null) {
-        lifecycleManager.unregisterFinder(reference.databaseId);
-      }
-    }
-  }
-
-  private void maybeCleanupStaleChannelFinders() {
-    if ((channelFinderCleanupCounter.incrementAndGet() & (CHANNEL_FINDER_CLEANUP_INTERVAL - 1))
-        == 0) {
-      cleanupStaleChannelFinders();
-    }
-  }
-
   private ChannelFinder getOrCreateChannelFinder(String databaseId) {
-    maybeCleanupStaleChannelFinders();
-    ChannelFinderReference ref = channelFinders.get(databaseId);
-    ChannelFinder finder = (ref != null) ? ref.get() : null;
-    if (finder == null) {
-      synchronized (channelFinders) {
-        ref = channelFinders.get(databaseId);
-        finder = (ref != null) ? ref.get() : null;
-        if (finder == null) {
-          finder = new ChannelFinder(endpointCache, lifecycleManager, databaseId);
-          channelFinders.put(
-              databaseId,
-              new ChannelFinderReference(databaseId, finder, channelFinderReferenceQueue));
-        }
-      }
+    try {
+      return channelFinders.get(
+          databaseId, () -> new ChannelFinder(endpointCache, lifecycleManager, databaseId));
+    } catch (ExecutionException executionException) {
+      // The loader only constructs a ChannelFinder and cannot throw a checked exception.
+      throw new IllegalStateException(executionException.getCause());
     }
-    return finder;
   }
 
   @com.google.common.annotations.VisibleForTesting
   void awaitPendingCacheUpdates() throws InterruptedException {
-    for (ChannelFinderReference ref : channelFinders.values()) {
-      ChannelFinder finder = ref.get();
-      if (finder != null) {
-        finder.awaitPendingUpdates();
-      }
+    for (ChannelFinder finder : channelFinders.asMap().values()) {
+      finder.awaitPendingUpdates();
     }
   }
 
@@ -262,7 +237,7 @@ final class KeyAwareChannel extends ManagedChannel {
 
   @Override
   public ManagedChannel shutdown() {
-    cleanupStaleChannelFinders();
+    channelFinders.invalidateAll();
     if (lifecycleManager != null) {
       lifecycleManager.shutdown();
     }
@@ -272,7 +247,7 @@ final class KeyAwareChannel extends ManagedChannel {
 
   @Override
   public ManagedChannel shutdownNow() {
-    cleanupStaleChannelFinders();
+    channelFinders.invalidateAll();
     if (lifecycleManager != null) {
       lifecycleManager.shutdown();
     }

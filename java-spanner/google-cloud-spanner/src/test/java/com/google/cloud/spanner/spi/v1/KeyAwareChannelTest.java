@@ -1155,6 +1155,41 @@ public class KeyAwareChannelTest {
     assertThat(harness.endpointCache.callCountForAddress("server-b:1234")).isEqualTo(1);
   }
 
+  @Test
+  public void channelFinderExpiresAfterInactivity() throws Exception {
+    FakeTicker ticker = new FakeTicker();
+    TestHarness harness = createHarness(ticker);
+    seedCache(harness, createTwoRangeCacheUpdate());
+
+    // The learned routing cache routes the query to the tablet's server.
+    ClientCall<ExecuteSqlRequest, ResultSet> routedCall =
+        harness.channel.newCall(SpannerGrpc.getExecuteSqlMethod(), CallOptions.DEFAULT);
+    routedCall.start(new CapturingListener<ResultSet>(), new Metadata());
+    routedCall.sendMessage(
+        ExecuteSqlRequest.newBuilder()
+            .setSession(SESSION)
+            .setRoutingHint(RoutingHint.newBuilder().setKey(bytes("b")).build())
+            .build());
+    assertThat(harness.endpointCache.callCountForAddress("server-a:1234")).isEqualTo(1);
+
+    ticker.advance(KeyAwareChannel.CHANNEL_FINDER_TTL_MINUTES + 1, TimeUnit.MINUTES);
+
+    // The idle ChannelFinder has been evicted along with its routing caches, so the same query
+    // falls back to the default channel until the cache is re-learned.
+    int defaultCallsBefore = harness.defaultManagedChannel.callCount();
+    ClientCall<ExecuteSqlRequest, ResultSet> expiredCall =
+        harness.channel.newCall(SpannerGrpc.getExecuteSqlMethod(), CallOptions.DEFAULT);
+    expiredCall.start(new CapturingListener<ResultSet>(), new Metadata());
+    expiredCall.sendMessage(
+        ExecuteSqlRequest.newBuilder()
+            .setSession(SESSION)
+            .setRoutingHint(RoutingHint.newBuilder().setKey(bytes("b")).build())
+            .build());
+
+    assertThat(harness.endpointCache.callCountForAddress("server-a:1234")).isEqualTo(1);
+    assertThat(harness.defaultManagedChannel.callCount()).isEqualTo(defaultCallsBefore + 1);
+  }
+
   private static CacheUpdate createTwoRangeCacheUpdate() {
     return CacheUpdate.newBuilder()
         .setDatabaseId(7L)

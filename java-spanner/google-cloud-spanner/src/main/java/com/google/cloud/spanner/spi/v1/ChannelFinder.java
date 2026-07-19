@@ -32,7 +32,6 @@ import com.google.spanner.v1.TransactionSelector;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -68,6 +67,7 @@ public final class ChannelFinder {
       new java.util.concurrent.CountDownLatch(0);
   @Nullable private final EndpointLifecycleManager lifecycleManager;
   @Nullable private final String finderKey;
+  private volatile boolean stale = false;
 
   public ChannelFinder(ChannelEndpointCache endpointCache) {
     this(endpointCache, null, null);
@@ -95,6 +95,22 @@ public final class ChannelFinder {
   @Nullable
   String finderKey() {
     return finderKey;
+  }
+
+  /**
+   * Marks this finder as stale after it has been evicted from the per-database finder cache. A
+   * stale finder stops processing cache updates and stops publishing active addresses, so an
+   * in-flight call that still references it cannot re-register endpoints with the lifecycle manager
+   * after {@link EndpointLifecycleManager#unregisterFinder} has run.
+   *
+   * <p>Synchronizing on {@code updateLock} guarantees that a concurrent publish either completes
+   * before this method returns — and is then superseded by the finder-generation bump in the
+   * subsequent {@code unregisterFinder} call — or observes the stale flag and skips publishing.
+   */
+  void markStale() {
+    synchronized (updateLock) {
+      stale = true;
+    }
   }
 
   private static ExecutorService createCacheUpdatePool() {
@@ -136,16 +152,14 @@ public final class ChannelFinder {
   }
 
   public void update(CacheUpdate update) {
-    Set<String> currentAddresses;
     synchronized (updateLock) {
       applyUpdateLocked(update);
-      currentAddresses = snapshotActiveAddressesLocked();
+      publishLifecycleUpdateLocked();
     }
-    publishLifecycleUpdate(currentAddresses);
   }
 
   public void updateAsync(CacheUpdate update) {
-    if (!shouldProcessUpdate(update)) {
+    if (stale || !shouldProcessUpdate(update)) {
       return;
     }
     pendingUpdates.add(new PendingCacheUpdate(update));
@@ -187,14 +201,12 @@ public final class ChannelFinder {
   }
 
   private void applyBatch(List<PendingCacheUpdate> batch) {
-    Set<String> currentAddresses;
     synchronized (updateLock) {
       for (PendingCacheUpdate pendingUpdate : batch) {
         applyUpdateLocked(pendingUpdate.update);
       }
-      currentAddresses = snapshotActiveAddressesLocked();
+      publishLifecycleUpdateLocked();
     }
-    publishLifecycleUpdate(currentAddresses);
   }
 
   private void applyUpdateLocked(CacheUpdate update) {
@@ -213,19 +225,16 @@ public final class ChannelFinder {
     rangeCache.addRanges(update);
   }
 
-  @Nullable
-  private Set<String> snapshotActiveAddressesLocked() {
-    if (lifecycleManager == null || finderKey == null) {
-      return null;
-    }
-    return rangeCache.getActiveAddresses();
-  }
-
-  private void publishLifecycleUpdate(@Nullable Set<String> currentAddresses) {
-    if (currentAddresses == null) {
+  /**
+   * Publishes the active addresses to the lifecycle manager. Must be called while holding {@code
+   * updateLock} so the publish is ordered with {@link #markStale()}; the call itself only enqueues
+   * work for the lifecycle manager's reconciliation worker.
+   */
+  private void publishLifecycleUpdateLocked() {
+    if (stale || lifecycleManager == null || finderKey == null) {
       return;
     }
-    lifecycleManager.updateActiveAddressesAsync(finderKey, currentAddresses);
+    lifecycleManager.updateActiveAddressesAsync(finderKey, rangeCache.getActiveAddresses());
   }
 
   /**
