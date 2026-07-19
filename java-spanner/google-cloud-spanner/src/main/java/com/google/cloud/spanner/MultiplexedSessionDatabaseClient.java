@@ -160,7 +160,7 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
     }
 
     /**
-     * Returns the channel hint that was reserved for this single-use transaction, so a subsequent
+     * Releases the channel hint that was reserved for this single-use transaction, so a subsequent
      * single-use transaction can use the channel. This method is idempotent; the hint is released
      * by whichever of {@link #onReadDone()} and {@link #onTransactionDone()} is called first.
      */
