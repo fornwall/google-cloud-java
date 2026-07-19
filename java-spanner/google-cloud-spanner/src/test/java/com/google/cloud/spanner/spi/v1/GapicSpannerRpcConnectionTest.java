@@ -98,7 +98,7 @@ public class GapicSpannerRpcConnectionTest {
   }
 
   @Test
-  public void testDirectPathFallbackCreatesExactlyFourPhysicalSockets() {
+  public void testDirectPathFallbackCreatesExactlySixteenPhysicalSockets() {
     SpannerOptions.useEnvironment(new SpannerOptions.SpannerEnvironment() {});
     GapicSpannerRpc rpc = null;
     try {

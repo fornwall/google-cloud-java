@@ -234,6 +234,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 /** Implementation of Cloud Spanner remote calls using Gapic libraries. */
 @InternalApi
@@ -2470,6 +2471,10 @@ public class GapicSpannerRpc implements SpannerRpc {
     }
 
     private final StubFactory<T> factory;
+
+    @GuardedBy("this")
+    private boolean closed;
+
     private volatile T stub;
 
     LazyAdminStub(StubFactory<T> factory) {
@@ -2480,11 +2485,16 @@ public class GapicSpannerRpc implements SpannerRpc {
       T result = this.stub;
       if (result == null) {
         synchronized (this) {
+          if (this.closed) {
+            throw newSpannerException(
+                ErrorCode.FAILED_PRECONDITION,
+                "Cannot use an admin stub after the client has been closed");
+          }
           result = this.stub;
           if (result == null) {
             try {
               result = this.factory.create();
-            } catch (IOException e) {
+            } catch (Exception e) {
               throw asSpannerException(e);
             }
             this.stub = result;
@@ -2494,10 +2504,17 @@ public class GapicSpannerRpc implements SpannerRpc {
       return result;
     }
 
-    /** Returns the stub if it has already been created, or {@code null} otherwise. */
+    /**
+     * Marks this holder as closed so no new stub can be created, and returns the stub if one was
+     * already created, or {@code null} otherwise. Closing the returned stub is the caller's
+     * responsibility.
+     */
     @Nullable
-    T getIfPresent() {
-      return this.stub;
+    T closeAndGet() {
+      synchronized (this) {
+        this.closed = true;
+        return this.stub;
+      }
     }
   }
 
@@ -2506,9 +2523,10 @@ public class GapicSpannerRpc implements SpannerRpc {
     this.rpcIsClosed = true;
     closeResponseObservers();
     if (this.spannerStub != null) {
-      // Only close the admin stubs if they were actually created (they are built lazily).
-      InstanceAdminStub instanceAdminStub = this.lazyInstanceAdminStub.getIfPresent();
-      DatabaseAdminStub databaseAdminStub = this.lazyDatabaseAdminStub.getIfPresent();
+      // Only close the admin stubs if they were actually created (they are built lazily). This
+      // also prevents any new admin stub from being created after this point.
+      InstanceAdminStub instanceAdminStub = this.lazyInstanceAdminStub.closeAndGet();
+      DatabaseAdminStub databaseAdminStub = this.lazyDatabaseAdminStub.closeAndGet();
       this.spannerStub.close();
       this.partitionedDmlStub.close();
       if (instanceAdminStub != null) {
@@ -2538,11 +2556,10 @@ public class GapicSpannerRpc implements SpannerRpc {
   public void shutdownNow() {
     this.rpcIsClosed = true;
     closeResponseObservers();
-    // Only close the admin stubs if they were actually created (they are built lazily).
-    InstanceAdminStub instanceAdminStub =
-        this.lazyInstanceAdminStub == null ? null : this.lazyInstanceAdminStub.getIfPresent();
-    DatabaseAdminStub databaseAdminStub =
-        this.lazyDatabaseAdminStub == null ? null : this.lazyDatabaseAdminStub.getIfPresent();
+    // Only close the admin stubs if they were actually created (they are built lazily). This
+    // also prevents any new admin stub from being created after this point.
+    InstanceAdminStub instanceAdminStub = this.lazyInstanceAdminStub.closeAndGet();
+    DatabaseAdminStub databaseAdminStub = this.lazyDatabaseAdminStub.closeAndGet();
     this.spannerStub.close();
     this.partitionedDmlStub.close();
     if (instanceAdminStub != null) {
