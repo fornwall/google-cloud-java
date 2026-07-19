@@ -137,6 +137,34 @@ public class ChannelFinderTest {
     }
   }
 
+  @Test
+  public void markStaleDropsAsyncUpdates() throws Exception {
+    ChannelFinder finder = new ChannelFinder(new FakeEndpointCache());
+
+    finder.markStale();
+    finder.updateAsync(singleRangeUpdate(0));
+    finder.awaitPendingUpdates();
+
+    assertThat(rangeCache(finder).size()).isEqualTo(0);
+  }
+
+  @Test
+  public void markStaleStopsPublishingActiveAddressesToLifecycleManager() throws Exception {
+    RecordingLifecycleManager lifecycleManager =
+        new RecordingLifecycleManager(new FakeEndpointCache());
+    ChannelFinder finder = new ChannelFinder(new FakeEndpointCache(), lifecycleManager, "db-1");
+    try {
+      finder.update(singleRangeUpdate(0));
+      assertThat(lifecycleManager.publishCount.get()).isEqualTo(1);
+
+      finder.markStale();
+      finder.update(singleRangeUpdate(1));
+      assertThat(lifecycleManager.publishCount.get()).isEqualTo(1);
+    } finally {
+      lifecycleManager.shutdown();
+    }
+  }
+
   private static CacheUpdate singleRangeUpdate(int index) {
     String startKey = String.format("k%05d", index);
     String limitKey = String.format("k%05d", index + 1);
@@ -301,6 +329,19 @@ public class ChannelFinderTest {
     @Override
     public String authority() {
       return "fake";
+    }
+  }
+
+  private static final class RecordingLifecycleManager extends EndpointLifecycleManager {
+    private final AtomicInteger publishCount = new AtomicInteger();
+
+    private RecordingLifecycleManager(ChannelEndpointCache endpointCache) {
+      super(endpointCache);
+    }
+
+    @Override
+    void updateActiveAddressesAsync(String finderKey, java.util.Set<String> activeAddresses) {
+      publishCount.incrementAndGet();
     }
   }
 

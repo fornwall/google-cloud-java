@@ -100,8 +100,8 @@ public final class ChannelFinder {
   /**
    * Marks this finder as stale after it has been evicted from the per-database finder cache. A
    * stale finder stops processing cache updates and stops publishing active addresses, so an
-   * in-flight call that still references it cannot re-register endpoints with the lifecycle
-   * manager after {@link EndpointLifecycleManager#unregisterFinder} has run.
+   * in-flight call that still references it cannot re-register endpoints with the lifecycle manager
+   * after {@link EndpointLifecycleManager#unregisterFinder} has run.
    *
    * <p>Synchronizing on {@code updateLock} guarantees that a concurrent publish either completes
    * before this method returns — and is then superseded by the finder-generation bump in the

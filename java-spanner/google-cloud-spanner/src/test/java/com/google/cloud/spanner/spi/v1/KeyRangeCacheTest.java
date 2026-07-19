@@ -280,6 +280,65 @@ public class KeyRangeCacheTest {
   }
 
   @Test
+  public void addRangesEvictsWhenOverMaxRanges() {
+    FakeEndpointCache endpointCache = new FakeEndpointCache();
+    KeyRangeCache cache = new KeyRangeCache(endpointCache);
+    final int maxRanges = 50;
+    cache.setMaxRanges(maxRanges);
+
+    final int numRanges = 100;
+    for (int i = 0; i < numRanges; i++) {
+      CacheUpdate update =
+          CacheUpdate.newBuilder()
+              .addRange(
+                  Range.newBuilder()
+                      .setStartKey(bytes(String.format("%04d", i)))
+                      .setLimitKey(bytes(String.format("%04d", i + 1)))
+                      .setGroupUid(i)
+                      .setSplitId(i)
+                      .setGeneration(bytes("1")))
+              .addGroup(
+                  Group.newBuilder()
+                      .setGroupUid(i)
+                      .setGeneration(bytes("1"))
+                      .addTablets(
+                          Tablet.newBuilder()
+                              .setTabletUid(i)
+                              .setServerAddress("server" + i)
+                              .setIncarnation(bytes("1"))))
+              .build();
+      cache.addRanges(update);
+      // Pre-create endpoint so READY state check passes in shouldSkip.
+      endpointCache.get("server" + i);
+      assertTrue(cache.size() <= maxRanges);
+    }
+
+    // The shrink hysteresis keeps the cache within 10% below the limit.
+    assertTrue(cache.size() >= maxRanges - maxRanges / 10);
+
+    // Every resident range still routes to its own server, and the most recently added range
+    // always survives eviction.
+    int hitCount = 0;
+    for (int i = 0; i < numRanges; i++) {
+      RoutingHint.Builder hint = RoutingHint.newBuilder().setKey(bytes(String.format("%04d", i)));
+      ChannelEndpoint server =
+          cache.fillRoutingHint(
+              false,
+              KeyRangeCache.RangeMode.COVERING_SPLIT,
+              DirectedReadOptions.getDefaultInstance(),
+              hint);
+      if (server != null) {
+        hitCount++;
+        assertEquals("server" + i, server.getAddress());
+      }
+      if (i == numRanges - 1) {
+        assertNotNull(server);
+      }
+    }
+    assertEquals(cache.size(), hitCount);
+  }
+
+  @Test
   public void readyEndpointIsUsableForLocationAware() {
     FakeEndpointCache endpointCache = new FakeEndpointCache();
     KeyRangeCache cache = new KeyRangeCache(endpointCache);
