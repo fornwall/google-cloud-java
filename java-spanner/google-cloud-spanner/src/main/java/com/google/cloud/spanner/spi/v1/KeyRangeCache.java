@@ -60,6 +60,8 @@ public final class KeyRangeCache {
   private static final int DEFAULT_MIN_ENTRIES_FOR_RANDOM_PICK = 1000;
   private static final double LOCAL_LEADER_SELECTION_COST_MULTIPLIER = 0.5D;
 
+  @VisibleForTesting static final int DEFAULT_MAX_RANGES = 10_000;
+
   /** Determines how to handle ranges that span multiple splits. */
   public enum RangeMode {
     /** Consider it a cache miss if the whole range is not in a single split. */
@@ -160,6 +162,7 @@ public final class KeyRangeCache {
 
   private volatile boolean deterministicRandom = false;
   private volatile int minCacheEntriesForRandomPick = DEFAULT_MIN_ENTRIES_FOR_RANDOM_PICK;
+  private volatile int maxRanges = DEFAULT_MAX_RANGES;
 
   public KeyRangeCache(ChannelEndpointCache endpointCache) {
     this(endpointCache, null, null);
@@ -188,6 +191,11 @@ public final class KeyRangeCache {
   @VisibleForTesting
   void setMinCacheEntriesForRandomPick(int value) {
     minCacheEntriesForRandomPick = value;
+  }
+
+  @VisibleForTesting
+  void setMaxRanges(int value) {
+    maxRanges = value;
   }
 
   @VisibleForTesting
@@ -234,6 +242,18 @@ public final class KeyRangeCache {
       } finally {
         writeLock.unlock();
       }
+    }
+    maybeShrink();
+  }
+
+  /**
+   * Evicts least-recently-accessed ranges when the cache has grown beyond {@link #maxRanges}.
+   * Shrinks below the limit so the O(size) eviction cost is amortized over many insertions.
+   */
+  private void maybeShrink() {
+    int max = maxRanges;
+    if (size() > max) {
+      shrinkTo(max - max / 10);
     }
   }
 
