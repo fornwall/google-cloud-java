@@ -19,13 +19,18 @@ package com.google.cloud.spanner;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.api.core.ApiFutures;
@@ -34,13 +39,16 @@ import com.google.cloud.grpc.GrpcTransportOptions.ExecutorFactory;
 import com.google.cloud.spanner.SessionClient.SessionConsumer;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -348,6 +356,137 @@ public class MultiplexedSessionDatabaseClientTest {
     }
   }
 
+  @Test
+  public void testChannelUsageDoesNotPinSpannerThatIsNotClosed() throws Exception {
+    assertEquals(0, getChannelUsage().size());
+
+    SpannerImpl spanner = createTestSpanner();
+    SessionClient sessionClient = createSessionClient(spanner);
+    MultiplexedSessionDatabaseClient client =
+        new MultiplexedSessionDatabaseClient(sessionClient, Clock.systemUTC());
+    assertEquals(1, getChannelUsage().size());
+
+    // Drop all references to the client and the Spanner instance *without* closing them. The
+    // CHANNEL_USAGE map is keyed weakly, so it must not keep the Spanner instance (and with it the
+    // entire client graph) alive.
+    WeakReference<SpannerImpl> spannerReference = new WeakReference<>(spanner);
+    client = null;
+    sessionClient = null;
+    spanner = null;
+
+    for (int attempt = 0; attempt < 100 && spannerReference.get() != null; attempt++) {
+      System.gc();
+      Thread.sleep(10L);
+    }
+
+    assertNull(spannerReference.get());
+    assertEquals(0, getChannelUsage().size());
+  }
+
+  @Test
+  public void testSessionReadySchedulesMaintainer() throws Exception {
+    try (SpannerImpl spanner = createTestSpanner();
+        DeferredMultiplexedSessionClient sessionClient =
+            new DeferredMultiplexedSessionClient(spanner)) {
+      MultiplexedSessionDatabaseClient client =
+          new MultiplexedSessionDatabaseClient(sessionClient, Clock.systemUTC());
+      // The CreateSession RPC is still in flight, so no maintenance task has been scheduled yet.
+      assertNull(getScheduledFuture(client));
+
+      sessionClient.completeSessionCreation();
+      ScheduledFuture<?> scheduledFuture = getScheduledFuture(client);
+      assertNotNull(scheduledFuture);
+      assertFalse(scheduledFuture.isCancelled());
+
+      client.close();
+      assertTrue(scheduledFuture.isCancelled());
+    }
+  }
+
+  @Test
+  public void testCloseBeforeSessionReadyDoesNotScheduleMaintainer() throws Exception {
+    try (SpannerImpl spanner = createTestSpanner();
+        DeferredMultiplexedSessionClient sessionClient =
+            new DeferredMultiplexedSessionClient(spanner)) {
+      MultiplexedSessionDatabaseClient client =
+          new MultiplexedSessionDatabaseClient(sessionClient, Clock.systemUTC());
+
+      // Close the client while the initial CreateSession RPC is still in flight. maintainer.stop()
+      // has nothing to cancel at this point.
+      client.close();
+
+      // The CreateSession RPC now completes. This must not schedule a maintenance task, as nothing
+      // would ever cancel it again.
+      sessionClient.completeSessionCreation();
+
+      assertNull(getScheduledFuture(client));
+    }
+  }
+
+  @Test
+  public void testMaintainerTaskCancelsItselfWhenMaintainerIsCollected() throws Exception {
+    try (SpannerImpl spanner = createTestSpanner();
+        SessionClient sessionClient = createSessionClient(spanner)) {
+      MultiplexedSessionDatabaseClient client =
+          new MultiplexedSessionDatabaseClient(sessionClient, Clock.systemUTC());
+
+      ScheduledFuture<?> scheduledFuture = mock(ScheduledFuture.class);
+      MultiplexedSessionDatabaseClient.MaintainerTask task =
+          new MultiplexedSessionDatabaseClient.MaintainerTask(client.getMaintainer());
+      task.setScheduledFuture(scheduledFuture);
+
+      // As long as the maintainer is reachable, the task just runs the maintenance. The session has
+      // not expired, so this is a no-op.
+      task.run();
+      verify(scheduledFuture, never()).cancel(anyBoolean());
+
+      // Clear the weak reference to simulate the client being garbage collected without being
+      // closed. The task must then cancel itself, so that the static executor stops running it.
+      clearMaintainerReference(task);
+      task.run();
+      verify(scheduledFuture).cancel(false);
+    }
+  }
+
+  @Test
+  public void testUseAfterCloseThrows() {
+    try (SpannerImpl spanner = createTestSpanner();
+        SessionClient sessionClient = createSessionClient(spanner)) {
+      MultiplexedSessionDatabaseClient client =
+          new MultiplexedSessionDatabaseClient(sessionClient, Clock.systemUTC());
+      client.close();
+
+      assertThrows(IllegalStateException.class, client::singleUse);
+    }
+  }
+
+  @Test
+  public void testIsClosedIsVolatile() throws Exception {
+    // isClosed is written under synchronized(this) in close(), but read without any synchronization
+    // in createMultiplexedSessionTransaction(..). It must therefore be volatile for that read to be
+    // guaranteed to observe the close.
+    Field field = MultiplexedSessionDatabaseClient.class.getDeclaredField("isClosed");
+    assertTrue(Modifier.isVolatile(field.getModifiers()));
+  }
+
+  private ScheduledFuture<?> getScheduledFuture(MultiplexedSessionDatabaseClient client)
+      throws Exception {
+    Field field =
+        MultiplexedSessionDatabaseClient.MultiplexedSessionMaintainer.class.getDeclaredField(
+            "scheduledFuture");
+    field.setAccessible(true);
+    return (ScheduledFuture<?>) field.get(client.getMaintainer());
+  }
+
+  private void clearMaintainerReference(MultiplexedSessionDatabaseClient.MaintainerTask task)
+      throws Exception {
+    Field field =
+        MultiplexedSessionDatabaseClient.MaintainerTask.class.getDeclaredField(
+            "maintainerReference");
+    field.setAccessible(true);
+    ((WeakReference<?>) field.get(task)).clear();
+  }
+
   private SessionClient createSessionClient(SpannerImpl spanner) {
     return new FailingMultiplexedSessionClient(spanner);
   }
@@ -402,6 +541,33 @@ public class MultiplexedSessionDatabaseClientTest {
       } catch (InterruptedException e) {
         throw new RuntimeException(e);
       }
+    }
+  }
+
+  /**
+   * {@link SessionClient} that does not complete the CreateSession RPC until {@link
+   * #completeSessionCreation()} is called. This allows tests to interleave {@link
+   * MultiplexedSessionDatabaseClient#close()} with the completion of the initial session creation.
+   */
+  private static final class DeferredMultiplexedSessionClient extends SessionClient {
+    private static final DatabaseId TEST_DATABASE_ID =
+        DatabaseId.of("test-project", "test-instance", "test-database");
+
+    private SessionConsumer consumer;
+
+    private DeferredMultiplexedSessionClient(SpannerImpl spanner) {
+      super(spanner, TEST_DATABASE_ID, new TestExecutorFactory());
+    }
+
+    @Override
+    void asyncCreateMultiplexedSession(SessionConsumer consumer) {
+      this.consumer = consumer;
+    }
+
+    void completeSessionCreation() {
+      SessionImpl session = mock(SessionImpl.class);
+      when(session.getSessionReference()).thenReturn(mock(SessionReference.class));
+      this.consumer.onSessionReady(session);
     }
   }
 
