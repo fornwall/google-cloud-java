@@ -31,13 +31,14 @@ import com.google.cloud.spanner.SpannerException.ResourceNotFoundException;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.spanner.v1.BatchWriteResponse;
+import java.lang.ref.WeakReference;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.BitSet;
 import java.util.EnumSet;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -172,7 +173,13 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
     }
   }
 
-  private static final Map<SpannerImpl, SharedChannelUsage> CHANNEL_USAGE = new HashMap<>();
+  /**
+   * Keyed weakly on the {@link SpannerImpl} instance, so that an application that drops a {@link
+   * Spanner} instance without closing it does not permanently pin the entire client graph through
+   * this static map. The entry for a {@link SpannerImpl} that is still in use is kept alive by the
+   * strong reference that each {@link MultiplexedSessionDatabaseClient} holds to it.
+   */
+  private static final Map<SpannerImpl, SharedChannelUsage> CHANNEL_USAGE = new WeakHashMap<>();
 
   private static final EnumSet<ErrorCode> RETRYABLE_ERROR_CODES =
       EnumSet.of(ErrorCode.DEADLINE_EXCEEDED, ErrorCode.RESOURCE_EXHAUSTED, ErrorCode.UNAVAILABLE);
@@ -186,7 +193,12 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
    */
   private final AtomicInteger numCurrentSingleUseTransactions = new AtomicInteger();
 
-  private boolean isClosed;
+  /**
+   * Written under {@code synchronized(this)} in {@link #close()}, but read without any
+   * synchronization in {@link #createMultiplexedSessionTransaction(boolean)}. It must therefore be
+   * volatile for the latter to be guaranteed to observe the close.
+   */
+  private volatile boolean isClosed;
 
   /** The duration before we try to replace the multiplexed session. The default is 7 days. */
   private final Duration sessionExpirationDuration;
@@ -623,16 +635,65 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
           ThreadFactoryUtil.createVirtualOrPlatformDaemonThreadFactory(
               "multiplexed-session-maintainer", /* tryVirtual= */ false));
 
+  /**
+   * The task that is scheduled on the static {@link #MAINTAINER_SERVICE}. It only holds a {@link
+   * WeakReference} to the maintainer, so that an application that drops a {@link Spanner} instance
+   * without closing it is not kept alive by the static executor. The task cancels itself as soon as
+   * it notices that the maintainer has been garbage collected.
+   */
+  @VisibleForTesting
+  static final class MaintainerTask implements Runnable {
+    private final WeakReference<MultiplexedSessionMaintainer> maintainerReference;
+
+    private final AtomicReference<ScheduledFuture<?>> scheduledFuture = new AtomicReference<>();
+
+    MaintainerTask(MultiplexedSessionMaintainer maintainer) {
+      this.maintainerReference = new WeakReference<>(maintainer);
+    }
+
+    void setScheduledFuture(ScheduledFuture<?> scheduledFuture) {
+      this.scheduledFuture.set(scheduledFuture);
+    }
+
+    @Override
+    public void run() {
+      MultiplexedSessionMaintainer maintainer = this.maintainerReference.get();
+      if (maintainer == null) {
+        // The client was garbage collected without being closed. Cancel this task, as it would
+        // otherwise keep running for the lifetime of the JVM.
+        ScheduledFuture<?> future = this.scheduledFuture.get();
+        if (future != null) {
+          future.cancel(false);
+        }
+        return;
+      }
+      maintainer.maintain();
+    }
+  }
+
   final class MultiplexedSessionMaintainer {
     private final Clock clock;
 
     private ScheduledFuture<?> scheduledFuture;
+
+    private boolean stopped;
 
     MultiplexedSessionMaintainer(Clock clock) {
       this.clock = clock;
     }
 
     private synchronized void start() {
+      if (this.stopped) {
+        // The client was closed while the initial CreateSession RPC was still in flight. Scheduling
+        // a maintenance task at this point would leak it, as close() has already run and nothing
+        // would ever cancel it again.
+        return;
+      }
+      if (this.scheduledFuture != null) {
+        // Already started. Scheduling a second task would leak the first one, as only the last
+        // scheduled future is retained and can be cancelled by stop().
+        return;
+      }
       // Schedule the maintainer to run once every ten minutes (by default).
       long loopFrequencyMillis =
           MultiplexedSessionDatabaseClient.this
@@ -642,12 +703,15 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
               .getSessionPoolOptions()
               .getMultiplexedSessionMaintenanceLoopFrequency()
               .toMillis();
+      MaintainerTask task = new MaintainerTask(this);
       this.scheduledFuture =
           MAINTAINER_SERVICE.scheduleAtFixedRate(
-              this::maintain, loopFrequencyMillis, loopFrequencyMillis, TimeUnit.MILLISECONDS);
+              task, loopFrequencyMillis, loopFrequencyMillis, TimeUnit.MILLISECONDS);
+      task.setScheduledFuture(this.scheduledFuture);
     }
 
     private synchronized void stop() {
+      this.stopped = true;
       if (this.scheduledFuture != null) {
         this.scheduledFuture.cancel(false);
       }
