@@ -21,6 +21,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
@@ -397,6 +398,28 @@ public class MultiplexedSessionDatabaseClientTest {
       ScheduledFuture<?> scheduledFuture = getScheduledFuture(client);
       assertNotNull(scheduledFuture);
       assertFalse(scheduledFuture.isCancelled());
+
+      client.close();
+      assertTrue(scheduledFuture.isCancelled());
+    }
+  }
+
+  @Test
+  public void testMaintainerIsOnlyScheduledOnce() throws Exception {
+    try (SpannerImpl spanner = createTestSpanner();
+        DeferredMultiplexedSessionClient sessionClient =
+            new DeferredMultiplexedSessionClient(spanner)) {
+      MultiplexedSessionDatabaseClient client =
+          new MultiplexedSessionDatabaseClient(sessionClient, Clock.systemUTC());
+
+      sessionClient.completeSessionCreation();
+      ScheduledFuture<?> scheduledFuture = getScheduledFuture(client);
+      assertNotNull(scheduledFuture);
+
+      // A second call must not schedule a second task, as only the last scheduled future is
+      // retained and can be cancelled by close().
+      sessionClient.completeSessionCreation();
+      assertSame(scheduledFuture, getScheduledFuture(client));
 
       client.close();
       assertTrue(scheduledFuture.isCancelled());

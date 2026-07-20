@@ -689,6 +689,11 @@ final class MultiplexedSessionDatabaseClient extends AbstractMultiplexedSessionD
         // would ever cancel it again.
         return;
       }
+      if (this.scheduledFuture != null) {
+        // Already started. Scheduling a second task would leak the first one, as only the last
+        // scheduled future is retained and can be cancelled by stop().
+        return;
+      }
       // Schedule the maintainer to run once every ten minutes (by default).
       long loopFrequencyMillis =
           MultiplexedSessionDatabaseClient.this
